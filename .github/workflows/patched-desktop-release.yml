@@ -1,0 +1,403 @@
+name: Patched desktop release (Windows x64)
+
+# Builds each upstream T3 Code nightly with the patch branches below applied and
+# publishes it here as a prerelease. Patched apps take their updates from this
+# repository's releases (their feed is baked in at build time).
+
+on:
+  schedule:
+    # Upstream publishes 3-5 nightlies a day; hourly keeps the lag under an hour.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream nightly tag to build (default: the newest published nightly)"
+        type: string
+        required: false
+      force:
+        description: "Rebuild even if this version is already released here"
+        type: boolean
+        default: false
+  # The patch fixer sends this after it pushes rebased patch branches. An optional
+  # client_payload {upstream_tag, force} works like the dispatch inputs.
+  repository_dispatch:
+    types: [patches-updated]
+
+permissions: {}
+
+concurrency:
+  group: patched-desktop-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: pingdotgg/t3code
+  PATCH_REPO: u9g/t3code
+  # Applied in this order; each contributes its commits that are not on upstream main.
+  PATCH_BRANCHES: feat/claude-code-cloud feat/desktop-update-repository
+  ISSUE_LABEL: patch-conflict
+
+jobs:
+  prepare:
+    name: Pick nightly and apply patches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      build: ${{ steps.apply.outputs.patched_sha != '' }}
+      upstream_tag: ${{ steps.pick.outputs.upstream_tag }}
+      version: ${{ steps.pick.outputs.version }}
+      upstream_sha: ${{ steps.pick.outputs.upstream_sha }}
+      patch_shas: ${{ steps.pick.outputs.patch_shas }}
+      key: ${{ steps.pick.outputs.key }}
+      release_exists: ${{ steps.pick.outputs.release_exists }}
+      patched_sha: ${{ steps.apply.outputs.patched_sha }}
+      failure: ${{ steps.apply.outputs.failure || steps.pick.outputs.failure }}
+      failed_branch: ${{ steps.apply.outputs.failed_branch || steps.pick.outputs.failed_branch }}
+      failed_commit: ${{ steps.apply.outputs.failed_commit }}
+      conflicts: ${{ steps.apply.outputs.conflicts }}
+    steps:
+      - name: Check out pipeline scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Pick upstream nightly
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.upstream_tag || github.event.client_payload.upstream_tag }}
+          FORCE: ${{ inputs.force || github.event.client_payload.force }}
+        run: bash scripts/pick-build.sh
+
+      - name: Apply patch branches
+        id: apply
+        if: steps.pick.outputs.build == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.pick.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ steps.pick.outputs.upstream_sha }}
+          PATCH_SHAS: ${{ steps.pick.outputs.patch_shas }}
+          WORK_DIR: ${{ runner.temp }}/src
+          BUNDLE: ${{ runner.temp }}/patched.bundle
+        run: bash scripts/apply-patches.sh
+
+      - name: Upload patched source
+        if: steps.apply.outputs.patched_sha != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: patched-source
+          path: ${{ runner.temp }}/patched.bundle
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Build Windows x64
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    # This job runs the patched tree and its npm dependencies, so it gets no write
+    # token; the publish job uploads what it produces.
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+      PATCHED_SHA: ${{ needs.prepare.outputs.patched_sha }}
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: patched-source
+          path: ${{ runner.temp }}/patched
+
+      # Same manual sparse checkout as upstream's release-desktop.yml: actions/checkout
+      # cleanup fails on the orphaned gitlinks under .repos/. The bundle holds only
+      # the patch commits; the upstream commit they sit on comes from upstream.
+      - name: Check out patched source
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init -q .
+          git fetch -q --no-tags --depth=1 "https://github.com/$UPSTREAM_REPO.git" "$UPSTREAM_SHA"
+          git fetch -q "$RUNNER_TEMP/patched/patched.bundle" refs/heads/patched:refs/heads/patched
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q patched
+          test "$(git rev-parse HEAD)" = "$PATCHED_SHA"
+          git log --oneline "$UPSTREAM_SHA..HEAD"
+
+      # Upstream measured the package cache as slower than a plain install on Windows.
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      # Upstream splits this across a Linux bundle job and the Windows job; here one
+      # job does both, so the install covers the web client too.
+      - name: Install dependencies
+        env:
+          # The store sits on the workspace volume so pnpm hardlinks instead of copying.
+          pnpm_config_store_dir: ${{ runner.temp }}/pnpm-store
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      # .env.example carries the public T3 Connect identifiers (Clerk publishable key,
+      # relay URL) that official builds bake in; without them cloud features are off.
+      - name: Configure release build
+        shell: bash
+        run: |
+          cp .env.example .env
+          node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      # Only the resource monitor build needs these; with a cached monitor the
+      # desktop build's preflight skips its Rust and MSVC checks.
+      - name: Install Spectre-mitigated MSVC libs
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      # The WSL backend runs the Linux CLI inside the distro. Upstream's archive for
+      # the same version is used as is, so WSL runs the unpatched server.
+      - name: Download WSL runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="t3-$VERSION-linux-x64.tar.gz"
+          gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -p "$archive" -p SHA256SUMS -D wsl-runtime
+          cd wsl-runtime
+          awk -v f="$archive" '$2 == f' SHA256SUMS | sha256sum -c -
+
+      # Unsigned: no --signed and no Azure or CSC secrets. Updates between unsigned
+      # builds then skip electron-updater's publisher check (the installed app has no
+      # publisherName); the sha512 in nightly.yml is still verified.
+      - name: Build desktop artifact
+        shell: bash
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: |
+          vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "$VERSION" \
+            --skip-build --verbose --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-$VERSION-linux-x64.tar.gz"
+
+      # A wrong baked feed would strand every install, so read it back out of the
+      # installer before anything is published.
+      - name: Check installer and update feed
+        shell: bash
+        env:
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          exe="release/T3-Code-$VERSION-x64.exe"
+          for f in "$exe" "$exe.blockmap" release/nightly.yml; do test -s "$f"; done
+          cat release/nightly.yml
+          grep -qFx -e "version: $VERSION" -e "version: '$VERSION'" release/nightly.yml
+          grep -qF "url: T3-Code-$VERSION-x64.exe" release/nightly.yml
+          feed="$RUNNER_TEMP/feed"
+          # shellcheck disable=SC2016 # $PLUGINSDIR is a literal folder name inside the NSIS installer
+          7z e -y -o"$feed" "$exe" '$PLUGINSDIR/app-64.7z' >/dev/null
+          7z e -y -o"$feed" "$feed/app-64.7z" resources/app-update.yml >/dev/null
+          tr -d '\r' <"$feed/app-update.yml" >"$feed/app-update.lf.yml"
+          cat "$feed/app-update.lf.yml"
+          for line in "provider: github" "owner: ${RELEASE_REPO%/*}" "repo: ${RELEASE_REPO#*/}" \
+            "releaseType: prerelease" "channel: nightly"; do
+            grep -qxF "$line" "$feed/app-update.lf.yml" || { echo "::error::app-update.yml lacks '$line'"; exit 1; }
+          done
+          # With a publisherName the updater would demand a signature these unsigned
+          # installers do not have, and every update would fail.
+          if grep -q '^publisherName:' "$feed/app-update.lf.yml"; then
+            echo "::error::app-update.yml has a publisherName, but this build is unsigned"
+            exit 1
+          fi
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-win-x64
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            release/T3-Code-${{ env.VERSION }}-x64.exe
+            release/T3-Code-${{ env.VERSION }}-x64.exe.blockmap
+            release/nightly.yml
+
+  publish:
+    name: Publish release
+    needs: [prepare, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.upstream_tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+      PATCH_SHAS: ${{ needs.prepare.outputs.patch_shas }}
+      PATCHED_SHA: ${{ needs.prepare.outputs.patched_sha }}
+      RELEASE_EXISTS: ${{ needs.prepare.outputs.release_exists }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Schedule events carry no repository payload, hence the fallback.
+      LEDGER_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+    steps:
+      # The newest main, not the commit that triggered the run, so the ledger push
+      # fast-forwards.
+      - name: Check out ledger
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.LEDGER_BRANCH }}
+
+      - name: Download installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-win-x64
+          path: dist
+
+      # GitHub orders releases, and the releases.atom feed the nightly channel reads,
+      # by the tagged commit's date. A fresh commit per build keeps the feed in build
+      # order, and builds only ever move forward.
+      - name: Record build in ledger
+        id: ledger
+        run: |
+          set -euo pipefail
+          read -r -a branches <<<"$PATCH_BRANCHES"
+          IFS=, read -r -a shas <<<"$PATCH_SHAS"
+          patches=$(for i in "${!branches[@]}"; do jq -cn --arg branch "${branches[$i]}" --arg sha "${shas[$i]}" '{$branch, $sha}'; done | jq -cs .)
+          mkdir -p builds
+          jq -n --arg tag "$TAG" --arg version "$VERSION" \
+            --arg upstream_repo "$UPSTREAM_REPO" --arg upstream_sha "$UPSTREAM_SHA" \
+            --arg patch_repo "$PATCH_REPO" --argjson patches "$patches" \
+            --arg patched_sha "$PATCHED_SHA" --arg run_url "$RUN_URL" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{$tag, $version, $upstream_repo, $upstream_sha, $patch_repo, $patches, $patched_sha, $run_url, $built_at}' \
+            >"builds/$TAG.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "builds/$TAG.json"
+          git commit -q -m "build: $TAG"
+          for attempt in 1 2 3; do
+            if git push -q origin "HEAD:$LEDGER_BRANCH"; then break; fi
+            if [[ $attempt == 3 ]]; then exit 1; fi
+            git pull -q --rebase origin "$LEDGER_BRANCH"
+          done
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          LEDGER_SHA: ${{ steps.ledger.outputs.sha }}
+        run: |
+          set -euo pipefail
+          read -r -a branches <<<"$PATCH_BRANCHES"
+          IFS=, read -r -a shas <<<"$PATCH_SHAS"
+          {
+            echo "Unofficial patched build of T3 Code [$TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) (\`$UPSTREAM_SHA\`). Windows x64, **unsigned**."
+            echo
+            echo "Patches from $PATCH_REPO, applied in order:"
+            for i in "${!branches[@]}"; do
+              echo "- [\`${branches[$i]}\`](https://github.com/$PATCH_REPO/tree/${branches[$i]}) at [\`${shas[$i]:0:12}\`](https://github.com/$PATCH_REPO/commit/${shas[$i]})"
+            done
+            echo
+            echo "Patched source commit \`$PATCHED_SHA\`, built by $RUN_URL. Build record: [\`builds/$TAG.json\`](https://github.com/$GH_REPO/blob/$LEDGER_SHA/builds/$TAG.json)."
+          } >notes.md
+          installer=("dist/T3-Code-$VERSION-x64.exe" "dist/T3-Code-$VERSION-x64.exe.blockmap")
+          if [[ $RELEASE_EXISTS == true ]]; then
+            # A forced rebuild of a published version swaps its files in place.
+            # Deleting and recreating it would briefly make the previous nightly the
+            # newest feed entry, and the nightly channel allows downgrades. The
+            # manifest goes last so it never names an installer that is not there.
+            gh release upload "$TAG" "${installer[@]}" --clobber
+            gh release upload "$TAG" dist/nightly.yml --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            # A draft left by a failed run holds the tag name; drafts never reach the feed.
+            drafts=$(gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName')
+            if grep -qxF "$TAG" <<<"$drafts"; then gh release delete "$TAG" --yes; fi
+            gh release create "$TAG" "${installer[@]}" dist/nightly.yml --draft --prerelease \
+              --target "$LEDGER_SHA" --title "T3 Code $VERSION (patched)" --notes-file notes.md
+            # Published only once every file is attached, so the feed never lists a
+            # release whose installer or nightly.yml is missing.
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+          fi
+          gh release view "$TAG" --json url,isDraft,isPrerelease,assets --jq '{url, isDraft, isPrerelease, assets: [.assets[].name]}'
+
+      - name: Close blocked-build issue
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[].number')
+          for number in $open; do
+            gh issue close "$number" --comment "Published $GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG, so this is resolved."
+          done
+
+  report:
+    name: Report blocked build
+    needs: [prepare, windows, publish]
+    # No key means the run failed before it knew what it was building (for example
+    # an API outage); that leaves only the red run, not an issue.
+    if: failure() && needs.prepare.outputs.key != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out pipeline scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Open or update issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          KIND: ${{ needs.prepare.outputs.failure || (needs.prepare.result == 'failure' && 'prepare') || (needs.windows.result == 'failure' && 'build') || 'publish' }}
+          KEY: ${{ needs.prepare.outputs.key }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          PATCH_SHAS: ${{ needs.prepare.outputs.patch_shas }}
+          CONFLICTS: ${{ needs.prepare.outputs.conflicts }}
+          FAILED_BRANCH: ${{ needs.prepare.outputs.failed_branch }}
+          FAILED_COMMIT: ${{ needs.prepare.outputs.failed_commit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          T3_PATCH_FIX_WEBHOOK: ${{ secrets.T3_PATCH_FIX_WEBHOOK }}
+        run: bash scripts/report-failure.sh
