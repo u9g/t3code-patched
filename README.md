@@ -70,7 +70,7 @@ runs every hour, on manual dispatch, and on a `patches-updated` repository dispa
 3. **publish** commits `builds/<tag>.json` to `main` (a fresh commit per build keeps the
    release feed in build order), creates the release as a draft, uploads the three files,
    then publishes it as a prerelease that is not marked latest. It closes any open
-   `patch-conflict` issue.
+   `patch-conflict` issue about that nightly or an older one.
 4. **report** runs when anything above fails (see below).
 
 ## Adding or removing a patch branch
@@ -116,7 +116,7 @@ for each key is also POSTed there as JSON (failures to deliver are ignored):
 
 `failed_branch` is `null` and `conflicts` is empty for a build failure. A missing branch or a
 publish failure opens the issue without calling the webhook. The issue is closed by the next
-successful publish.
+successful publish of that nightly or a newer one.
 
 ## Building or rebuilding a specific version
 

@@ -360,13 +360,24 @@ jobs:
           fi
           gh release view "$TAG" --json url,isDraft,isPrerelease,assets --jq '{url, isDraft, isPrerelease, assets: [.assets[].name]}'
 
+      # Only an issue about this nightly or an older one is resolved. A forced rebuild
+      # can publish while a newer nightly is still blocked; closing that issue would
+      # make the next run report its unchanged key again and re-notify the fixer.
       - name: Close blocked-build issue
         run: |
           set -euo pipefail
-          open=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[].number')
-          for number in $open; do
-            gh issue close "$number" --comment "Published $GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG, so this is resolved."
-          done
+          published=${TAG##*.}
+          gh issue list --label "$ISSUE_LABEL" --state open --json number,body \
+            --jq '.[] | "\(.number)\t\(.body // "" | split("\n") | map(rtrimstr("\r") | select(startswith("key: "))) | .[0] // "")"' |
+            while IFS=$'\t' read -r number key; do
+              blocked=${key#key: }
+              blocked=${blocked%%@*}
+              if [[ ${blocked##*.} =~ ^[0-9]+$ ]] && ((${blocked##*.} > published)); then
+                echo "leaving #$number open: $blocked is newer than $TAG"
+                continue
+              fi
+              gh issue close "$number" --comment "Published $GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG, so this is resolved."
+            done
 
   report:
     name: Report blocked build
