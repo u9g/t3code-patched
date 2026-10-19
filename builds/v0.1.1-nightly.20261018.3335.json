@@ -7,14 +7,14 @@
   "patches": [
     {
       "branch": "feat/claude-code-cloud",
-      "sha": "76307c2756679e03e9757ca84fec59455c8bec8d"
+      "sha": "2c20abfe830b801fb935f931eb3de7bcd17b1569"
     },
     {
       "branch": "feat/desktop-update-repository",
       "sha": "e17aeb23a4eabfdb452f19e75529f7ddb1ba20ce"
     }
   ],
-  "patched_sha": "0ee5b96c451470d16764884bbd44a4159ee4ff1b",
-  "run_url": "https://github.com/u9g/t3code-patched/actions/runs/39186737923",
-  "built_at": "2026-10-19T01:49:47Z"
+  "patched_sha": "dbf26605df33abf23c9eece1b7fbb72be31e7943",
+  "run_url": "https://github.com/u9g/t3code-patched/actions/runs/39190121868",
+  "built_at": "2026-10-19T02:33:10Z"
 }
