@@ -12,10 +12,17 @@
 #   ISSUE_LABEL     label of the blocked-build issue (default patch-conflict)
 #   EVENT_NAME      github.event_name (default workflow_dispatch)
 #   INPUT_TAG       upstream nightly tag to build instead of the newest one
-#   FORCE           "true" rebuilds a version that is already released here
+#   FORCE           "true" builds a new revision even if the patch branches are
+#                   unchanged since the newest release here
 #
-# Outputs: build, upstream_tag, version, upstream_sha, patch_shas, key,
-#          release_exists, and on a missing branch failure + failed_branch.
+# Outputs: build, upstream_tag, upstream_version, tag, version, upstream_sha,
+#          patch_shas, key, and on a missing branch failure + failed_branch.
+#
+# A release here is upstream's nightly version with the run number times 100 plus
+# a revision: upstream v1.2.3-nightly.20261019.3348 ships here as .334800, and a
+# patch branch push rebuilds it as .334801. The updater only offers a version that
+# differs from the installed one; this one keeps the nightly shape the app accepts
+# and sorts between upstream's nightlies.
 set -euo pipefail
 
 : "${UPSTREAM_REPO:?}" "${PATCH_REPO:?}" "${PATCH_BRANCHES:?}" "${RELEASE_REPO:?}"
@@ -44,6 +51,13 @@ fail() {
   exit 1
 }
 
+# Releases made before revisions carry upstream's run number unchanged; they rank
+# just below revision 0 of the same nightly.
+release_rank() {
+  local run=${1##*.}
+  if ((run >= 100000)); then echo "$run"; else echo $((run * 100 - 1)); fi
+}
+
 # The last tag component is upstream's release.yml run number. Every nightly comes
 # from that one workflow, so the number only grows, across version bumps too.
 newest_nightly() {
@@ -70,23 +84,33 @@ fi
 version=${tag#v}
 run_number=${tag##*.}
 out upstream_tag "$tag"
-out version "$version"
+out upstream_version "$version"
 
 # The cheap checks come first because most hourly runs stop here.
 released=$(gh release list -R "$RELEASE_REPO" --limit 100 --exclude-drafts --json tagName --jq '.[].tagName')
-newest_here=$(newest_nightly <<<"$released")
-release_exists=false
-if grep -qxF "$tag" <<<"$released"; then release_exists=true; fi
-out release_exists "$release_exists"
-if [[ -n $newest_here && ${newest_here##*.} -gt $run_number ]]; then
-  # The nightly channel allows downgrades and follows the newest feed entry, so an
-  # older build published now would be offered to every installed app.
-  message="$tag is older than $newest_here, the newest release in $RELEASE_REPO"
-  if [[ -n $INPUT_TAG ]]; then fail "$message; refusing to publish it"; fi
-  skip "$message"
-fi
-if [[ $release_exists == true && $FORCE != true ]]; then
-  skip "$tag is already released in $RELEASE_REPO (dispatch with force to rebuild it)"
+newest_here=$(
+  { grep -E "$NIGHTLY_TAG_RE" <<<"$released" || true; } |
+    while read -r t; do printf '%s\t%s\n' "$(release_rank "$t")" "$t"; done |
+    sort -n | tail -n 1 | cut -f2
+)
+revision=0
+newest_upstream_run=
+if [[ -n $newest_here ]]; then
+  newest_run=${newest_here##*.}
+  newest_upstream_run=$newest_run
+  next_revision=0
+  if ((newest_run >= 100000)); then
+    newest_upstream_run=$((newest_run / 100))
+    next_revision=$((newest_run % 100 + 1))
+  fi
+  if ((newest_upstream_run > run_number)); then
+    # The nightly channel allows downgrades and follows the newest feed entry, so an
+    # older build published now would be offered to every installed app.
+    message="$tag is older than $newest_here, the newest release in $RELEASE_REPO"
+    if [[ -n $INPUT_TAG ]]; then fail "$message; refusing to publish it"; fi
+    skip "$message"
+  fi
+  if ((newest_upstream_run == run_number)); then revision=$next_revision; fi
 fi
 
 # Upstream creates the release before it uploads the files, and the Windows build
@@ -127,6 +151,19 @@ patch_shas=$(
 key="$tag@$patch_shas"
 out patch_shas "$patch_shas"
 out key "$key"
+
+if [[ $newest_upstream_run == "$run_number" && $FORCE != true ]]; then
+  # The ledger names the patch commits each release was built from.
+  built_shas=$(gh api -H "Accept: application/vnd.github.raw" "repos/$RELEASE_REPO/contents/builds/$newest_here.json" |
+    jq -r '[.patches[].sha] | join(",")') || fail "cannot read builds/$newest_here.json from $RELEASE_REPO"
+  if [[ $built_shas == "$patch_shas" ]]; then
+    skip "$newest_here already has these patch branch commits (dispatch with force to build a new revision)"
+  fi
+fi
+((revision <= 99)) || fail "$tag already has 100 patched revisions; wait for the next upstream nightly"
+patched_tag="${tag%.*}.$((run_number * 100 + revision))"
+out tag "$patched_tag"
+out version "${patched_tag#v}"
 
 if [[ $EVENT_NAME == schedule ]]; then
   reported=$(gh issue list -R "$RELEASE_REPO" --label "$ISSUE_LABEL" --state open --json body --jq '.[].body' | tr -d '\r')

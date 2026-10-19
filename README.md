@@ -12,10 +12,18 @@ by GitHub Actions from public sources; see [`builds/`](builds) for what went int
 
 ## Releases
 
-Every release is a prerelease tagged `v<upstream version>`, for example
-`v0.1.1-nightly.20261018.3315`. The version is exactly upstream's, so the app is
-"T3 Code (Nightly)" on the nightly update channel, and the CLI archives that SSH
-environments and `t3 update` fetch from upstream exist for it. Each release carries:
+Every release is a prerelease of one upstream nightly, versioned as that nightly with its
+run number times 100 plus a revision. Upstream `v0.1.1-nightly.20261019.3348` ships here as
+`v0.1.1-nightly.20261019.334800`, and each later build of it with changed patch branches
+as `.334801`, `.334802` and so on, up to 100 per nightly. The version keeps the nightly shape,
+so the app is "T3 Code (Nightly)" on the nightly update channel, and it sorts between
+upstream's nightlies, so installed apps update to every revision on their own.
+
+Only the desktop shell carries the revision. The server, web client and package versions
+stay exactly upstream's, so the CLI archives that SSH environments and `t3 update` fetch
+from upstream exist for them (the `feat/desktop-update-repository` patch makes SSH hosts
+fetch by the bundled server's version). Releases made before revisions carry upstream's
+version unchanged. Each release carries:
 
 - `T3-Code-<version>-x64.exe`, the NSIS installer
 - `T3-Code-<version>-x64.exe.blockmap`, for differential updates
@@ -54,10 +62,13 @@ SSH environments download upstream's CLI for that version.
 runs every hour, on manual dispatch, and on a `patches-updated` repository dispatch.
 
 1. **prepare** ([`scripts/pick-build.sh`](scripts/pick-build.sh)) picks the newest published
-   upstream nightly by its run number (the last number in the tag). It stops without building
-   if that version is already released here, if it is older than the newest release here, if
-   upstream has not finished uploading its files, or (on the hourly schedule) if the same
-   upstream tag and patch branch commits already failed and are reported in an open issue.
+   upstream nightly by its run number (the last number in the tag). A nightly not built here
+   yet gets revision 0; for the nightly already out, the next revision is built only when the
+   patch branch commits differ from the ones `builds/<tag>.json` records for the newest release.
+   So a push to a patch branch ships within the hour. It stops without building if the nightly
+   is older than the newest release here, if upstream has not finished uploading its files, or
+   (on the hourly schedule) if the same upstream tag and patch branch commits already failed
+   and are reported in an open issue.
    [`scripts/apply-patches.sh`](scripts/apply-patches.sh) then makes a blob-less clone, checks
    out the upstream tag (without the vendored `/.repos/` tree), and cherry-picks each branch's
    commits that are not on upstream main, in order. The result travels as a git bundle.
@@ -67,7 +78,7 @@ runs every hour, on manual dispatch, and on a `patches-updated` repository dispa
    cache miss), upstream's same-version Linux archive as the WSL runtime (checked against
    upstream's `SHA256SUMS`), then `dist:desktop:artifact --platform win --target nsis --arch x64`.
    This job has a read-only token.
-3. **publish** commits `builds/<tag>.json` to `main` (a fresh commit per build keeps the
+3. **publish** commits `builds/<tag>.json` (named by the release's own tag) to `main` (a fresh commit per build keeps the
    release feed in build order), creates the release as a draft, uploads the three files,
    then publishes it as a prerelease that is not marked latest. It closes any open
    `patch-conflict` issue about that nightly or an older one.
@@ -81,8 +92,7 @@ upstream main (merge commits are skipped, and commits an earlier branch already 
 are not applied twice), so keep each branch based on upstream main or on a nightly tag.
 A listed branch that does not exist fails the run with an issue that names it.
 
-The change takes effect with the next upstream nightly. To apply it to the version that is
-already out, rebuild it (below).
+The change takes effect with the next hourly run, as a new revision of the nightly that is out.
 
 ## Conflicts and failures
 
@@ -118,17 +128,16 @@ for each key is also POSTed there as JSON (failures to deliver are ignored):
 publish failure opens the issue without calling the webhook. The issue is closed by the next
 successful publish of that nightly or a newer one.
 
-## Building or rebuilding a specific version
+## Building a specific version
 
 ```sh
 # Build a particular upstream nightly (it must not be older than the newest release here)
 gh workflow run patched-desktop-release.yml -R u9g/t3code-patched -f upstream_tag=v0.1.1-nightly.20261018.3315
 
-# Rebuild the newest version in place, for example after fixing a broken build
-gh workflow run patched-desktop-release.yml -R u9g/t3code-patched -f upstream_tag=<tag> -f force=true
+# Build a new revision of the newest nightly even though the patch branches have not changed,
+# for example after a broken build
+gh workflow run patched-desktop-release.yml -R u9g/t3code-patched -f force=true
 ```
 
-A forced rebuild replaces the release's files in place rather than deleting the release, so
-the feed never briefly falls back to an older nightly. Apps that already installed that
-version will not download it again, because the version number is the same; they pick up
-the next nightly as usual.
+Every build is a new release with a higher version, so installed apps take it as an update.
+Releases are never replaced in place.

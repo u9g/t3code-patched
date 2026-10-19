@@ -15,7 +15,7 @@ on:
         type: string
         required: false
       force:
-        description: "Rebuild even if this version is already released here"
+        description: "Build a new revision even if the patch branches have not changed"
         type: boolean
         default: false
   # The patch fixer sends this after it pushes rebased patch branches. An optional
@@ -47,11 +47,12 @@ jobs:
     outputs:
       build: ${{ steps.apply.outputs.patched_sha != '' }}
       upstream_tag: ${{ steps.pick.outputs.upstream_tag }}
+      upstream_version: ${{ steps.pick.outputs.upstream_version }}
+      tag: ${{ steps.pick.outputs.tag }}
       version: ${{ steps.pick.outputs.version }}
       upstream_sha: ${{ steps.pick.outputs.upstream_sha }}
       patch_shas: ${{ steps.pick.outputs.patch_shas }}
       key: ${{ steps.pick.outputs.key }}
-      release_exists: ${{ steps.pick.outputs.release_exists }}
       patched_sha: ${{ steps.apply.outputs.patched_sha }}
       failure: ${{ steps.apply.outputs.failure || steps.pick.outputs.failure }}
       failed_branch: ${{ steps.apply.outputs.failed_branch || steps.pick.outputs.failed_branch }}
@@ -106,6 +107,7 @@ jobs:
       contents: read
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      UPSTREAM_VERSION: ${{ needs.prepare.outputs.upstream_version }}
       UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
       UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
       PATCHED_SHA: ${{ needs.prepare.outputs.patched_sha }}
@@ -151,11 +153,13 @@ jobs:
 
       # .env.example carries the public T3 Connect identifiers (Clerk publishable key,
       # relay URL) that official builds bake in; without them cloud features are off.
+      # The packages keep upstream's version, so the server, web client and remote
+      # runtimes match upstream's; only the desktop shell carries the revision.
       - name: Configure release build
         shell: bash
         run: |
           cp .env.example .env
-          node scripts/update-release-package-versions.ts "$VERSION"
+          node scripts/update-release-package-versions.ts "$UPSTREAM_VERSION"
 
       - name: Build JS bundle
         run: vp run build:desktop
@@ -201,7 +205,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          archive="t3-$VERSION-linux-x64.tar.gz"
+          archive="t3-$UPSTREAM_VERSION-linux-x64.tar.gz"
           gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -p "$archive" -p SHA256SUMS -D wsl-runtime
           cd wsl-runtime
           awk -v f="$archive" '$2 == f' SHA256SUMS | sha256sum -c -
@@ -216,7 +220,7 @@ jobs:
           T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
         run: |
           vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "$VERSION" \
-            --skip-build --verbose --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-$VERSION-linux-x64.tar.gz"
+            --skip-build --verbose --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-$UPSTREAM_VERSION-linux-x64.tar.gz"
 
       # A wrong baked feed would strand every install, so read it back out of the
       # installer before anything is published.
@@ -270,12 +274,12 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      TAG: ${{ needs.prepare.outputs.upstream_tag }}
+      TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
       UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
       PATCH_SHAS: ${{ needs.prepare.outputs.patch_shas }}
       PATCHED_SHA: ${{ needs.prepare.outputs.patched_sha }}
-      RELEASE_EXISTS: ${{ needs.prepare.outputs.release_exists }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       # Schedule events carry no repository payload, hence the fallback.
       LEDGER_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
@@ -304,12 +308,12 @@ jobs:
           IFS=, read -r -a shas <<<"$PATCH_SHAS"
           patches=$(for i in "${!branches[@]}"; do jq -cn --arg branch "${branches[$i]}" --arg sha "${shas[$i]}" '{$branch, $sha}'; done | jq -cs .)
           mkdir -p builds
-          jq -n --arg tag "$TAG" --arg version "$VERSION" \
+          jq -n --arg tag "$TAG" --arg version "$VERSION" --arg upstream_tag "$UPSTREAM_TAG" \
             --arg upstream_repo "$UPSTREAM_REPO" --arg upstream_sha "$UPSTREAM_SHA" \
             --arg patch_repo "$PATCH_REPO" --argjson patches "$patches" \
             --arg patched_sha "$PATCHED_SHA" --arg run_url "$RUN_URL" \
             --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{$tag, $version, $upstream_repo, $upstream_sha, $patch_repo, $patches, $patched_sha, $run_url, $built_at}' \
+            '{$tag, $version, $upstream_tag, $upstream_repo, $upstream_sha, $patch_repo, $patches, $patched_sha, $run_url, $built_at}' \
             >"builds/$TAG.json"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -330,7 +334,7 @@ jobs:
           read -r -a branches <<<"$PATCH_BRANCHES"
           IFS=, read -r -a shas <<<"$PATCH_SHAS"
           {
-            echo "Unofficial patched build of T3 Code [$TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) (\`$UPSTREAM_SHA\`). Windows x64, **unsigned**."
+            echo "Unofficial patched build of T3 Code [$UPSTREAM_TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$UPSTREAM_TAG) (\`$UPSTREAM_SHA\`). Windows x64, **unsigned**."
             echo
             echo "Patches from $PATCH_REPO, applied in order:"
             for i in "${!branches[@]}"; do
@@ -340,33 +344,23 @@ jobs:
             echo "Patched source commit \`$PATCHED_SHA\`, built by $RUN_URL. Build record: [\`builds/$TAG.json\`](https://github.com/$GH_REPO/blob/$LEDGER_SHA/builds/$TAG.json)."
           } >notes.md
           installer=("dist/T3-Code-$VERSION-x64.exe" "dist/T3-Code-$VERSION-x64.exe.blockmap")
-          if [[ $RELEASE_EXISTS == true ]]; then
-            # A forced rebuild of a published version swaps its files in place.
-            # Deleting and recreating it would briefly make the previous nightly the
-            # newest feed entry, and the nightly channel allows downgrades. The
-            # manifest goes last so it never names an installer that is not there.
-            gh release upload "$TAG" "${installer[@]}" --clobber
-            gh release upload "$TAG" dist/nightly.yml --clobber
-            gh release edit "$TAG" --notes-file notes.md
-          else
-            # A draft left by a failed run holds the tag name; drafts never reach the feed.
-            drafts=$(gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName')
-            if grep -qxF "$TAG" <<<"$drafts"; then gh release delete "$TAG" --yes; fi
-            gh release create "$TAG" "${installer[@]}" dist/nightly.yml --draft --prerelease \
-              --target "$LEDGER_SHA" --title "T3 Code $VERSION (patched)" --notes-file notes.md
-            # Published only once every file is attached, so the feed never lists a
-            # release whose installer or nightly.yml is missing.
-            gh release edit "$TAG" --draft=false --prerelease --latest=false
-          fi
+          # A draft left by a failed run holds the tag name; drafts never reach the feed.
+          drafts=$(gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName')
+          if grep -qxF "$TAG" <<<"$drafts"; then gh release delete "$TAG" --yes; fi
+          gh release create "$TAG" "${installer[@]}" dist/nightly.yml --draft --prerelease \
+            --target "$LEDGER_SHA" --title "T3 Code $VERSION (patched)" --notes-file notes.md
+          # Published only once every file is attached, so the feed never lists a
+          # release whose installer or nightly.yml is missing.
+          gh release edit "$TAG" --draft=false --prerelease --latest=false
           gh release view "$TAG" --json url,isDraft,isPrerelease,assets --jq '{url, isDraft, isPrerelease, assets: [.assets[].name]}'
 
-      # Only an issue about this nightly or an older one is resolved. A forced rebuild
-      # can publish while a newer nightly is still blocked; closing that issue would
-      # make the next run report its unchanged key again and re-notify the fixer.
+      # Only an issue about this nightly or an older one is resolved. A dispatched
+      # build can publish while a newer nightly is still blocked; closing that issue
+      # would make the next run report its unchanged key again and re-notify the fixer.
       - name: Close blocked-build issue
         run: |
           set -euo pipefail
-          published=${TAG##*.}
+          published=${UPSTREAM_TAG##*.}
           gh issue list --label "$ISSUE_LABEL" --state open --json number,body \
             --jq '.[] | "\(.number)\t\(.body // "" | split("\n") | map(rtrimstr("\r") | select(startswith("key: "))) | .[0] // "")"' |
             while IFS=$'\t' read -r number key; do
