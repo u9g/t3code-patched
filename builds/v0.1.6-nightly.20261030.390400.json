@@ -1,0 +1,21 @@
+{
+  "tag": "v0.1.6-nightly.20261030.390400",
+  "version": "0.1.6-nightly.20261030.390400",
+  "upstream_tag": "v0.1.6-nightly.20261030.3904",
+  "upstream_repo": "pingdotgg/t3code",
+  "upstream_sha": "36dac688a17c6de1c6398e62d01546fb787c185b",
+  "patch_repo": "u9g/t3code",
+  "patches": [
+    {
+      "branch": "feat/claude-code-cloud",
+      "sha": "c507648a04823078a6ebe019308bc935d6555243"
+    },
+    {
+      "branch": "feat/desktop-update-repository",
+      "sha": "4edc456faa04abf309afa3968b8b53b714b32daf"
+    }
+  ],
+  "patched_sha": "71987bfbc91f17d626e97890801c96b520f42e6f",
+  "run_url": "https://github.com/u9g/t3code-patched/actions/runs/41017971674",
+  "built_at": "2026-10-30T07:09:37Z"
+}
